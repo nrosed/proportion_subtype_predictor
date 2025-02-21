@@ -169,3 +169,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# project-specific ignores
+.history
+.DS_Store
+.venv
+.prop_subtype_venv
+.Rproj.user
+
+# large data, results ignores
+/data
+/results
