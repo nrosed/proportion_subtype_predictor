@@ -1,0 +1,253 @@
+---
+title: "get_celltypes.R"
+author: "Natalie Davidson"
+output: github_document
+date: '2024-12-11'
+---
+
+```{r setup12, include=FALSE}
+
+#knitr::opts_chunk$set(echo = TRUE)
+
+
+require(here)
+
+# OVC
+
+library(consensusOV)
+
+# Single cell
+library(scater)
+library(scran)
+library(DropletUtils)
+library(SingleR)
+
+# Annotation
+library(EnsDb.Hsapiens.v86)
+library(org.Hs.eg.db)
+library(EnrichmentBrowser)
+
+SUBTYPES <- c("DIF", "IMR", "MES", "PRO")
+
+
+proj_dir = "/Users/davidnat/Documents/projects/davidsonlab/projects/proportion_subtype_predictor/"
+
+data_dir = paste0(proj_dir, "/data/single_cell/GSE217517_RAW/")
+sample_ids = c("GSM6720925", "GSM6720926", "GSM6720927", 
+               "GSM6720928", "GSM6720929", "GSM6720930",
+               "GSM6720931", "GSM6720932")
+
+sample_dirs = paste0(data_dir, sample_ids, "/")
+
+curr_idx = 8 # run this for 1-8
+
+
+in_dir = "/Users/davidnat/Documents/projects/davidsonlab/projects/proportion_subtype_predictor/data/single_cell/GSE217517_metadata/"
+sample_ids = c("GSM6720925", "GSM6720926", "GSM6720927", 
+               "GSM6720928", "GSM6720929", "GSM6720930",
+               "GSM6720931", "GSM6720932")
+all_df = NA
+for(curr_samp in sample_ids){
+  curr_file = paste0(in_dir, curr_samp, "_subtypes.tsv")
+  curr_df = data.frame(fread(curr_file))
+  curr_df$samp_id = curr_samp
+  if(is.na(all_df)){
+    all_df = curr_df
+  }else{
+    all_df = rbind(all_df, curr_df)
+  }
+}
+outfile = paste0(in_dir, "cell_subtypes.tsv")
+
+write.table(all_df, outfile, sep="\t", quote=F, row.names=F)
+
+```
+
+
+```{r read_sc, include=FALSE}
+
+sce <- DropletUtils::read10xCounts(samples=sample_dirs[curr_idx], sample.names=sample_ids[curr_idx])
+dim(sce)
+
+
+```
+
+```{r process_sc, include=FALSE}
+
+
+rownames(sce) <- scater::uniquifyFeatureNames(rowData(sce)$ID,
+                                              rowData(sce)$Symbol)
+location <- AnnotationDbi::mapIds(EnsDb.Hsapiens.v86, keys = rowData(sce)$ID, 
+                                  column = "SEQNAME", keytype = "GENEID")
+
+
+
+```
+
+Testing for deviations from ambient expression:
+```{r, eval = FALSE}
+
+bcrank <- DropletUtils::barcodeRanks(counts(sce))
+uniq <- !duplicated(bcrank$rank)
+
+plot(bcrank$rank[uniq], bcrank$total[uniq], log="xy",
+    xlab="Rank", ylab="Total UMI count", cex.lab=1.2)
+
+abline(h=bcrank$inflection, col="darkgreen", lty=2)
+abline(h=bcrank$knee, col="dodgerblue", lty=2)
+
+legend("bottomleft", legend=c("Inflection", "Knee"),
+    col=c("darkgreen", "dodgerblue"), lty=2, cex=1.2)
+
+
+```
+
+Parallel computation:
+```{r}
+bp <- BiocParallel::registered()[[1]]
+```
+
+
+```{r qc_sc, include=FALSE}
+
+# QC the cells
+df <- scater::perCellQCMetrics(sce, 
+                       subsets = list(Mito = which(location == "MT")),
+                       BPPARAM = bp)
+par(mfrow = c(1,3))
+hist(df$sum/1e3, xlab="Library sizes (thousands)", main="",
+    breaks=20, col="grey80", ylab="Number of cells")
+hist(df$detected, xlab="Number of expressed genes", main="",
+    breaks=20, col="grey80", ylab="Number of cells")
+hist(df$subsets_Mito_percent, xlab="Mitochondrial proportion (%)",
+    ylab="Number of cells", breaks=20, main="", col="grey80")
+par(mfrow = c(1,1))
+
+high.mito <- scater::isOutlier(df$subsets_Mito_percent, nmads = 3, type = "higher")
+libsize.drop <- scater::isOutlier(df$sum, nmads = 1, type = "lower", log = TRUE)
+feature.drop <- scater::isOutlier(df$detected, nmads = 1, type = "lower", log = TRUE)
+sce <- sce[,!(high.mito | libsize.drop | feature.drop)]
+
+df <- data.frame(ByHighMito = sum(high.mito),
+           ByLibSize = sum(libsize.drop),
+           ByFeature = sum(feature.drop),
+           Remaining = ncol(sce))
+
+df
+dim(sce)
+
+```
+
+```{r remove_lowexpr, include=FALSE}
+
+ave <- scater::calculateAverage(sce, BPPARAM = bp)
+hist(log10(ave), breaks = 100, main = "", col = "grey",
+    xlab = expression(Log[10]~"average count"))
+
+# remove low expr genes
+rowData(sce)$AveCount <- ave
+to.keep <- ave > 0.001
+sce <- sce[to.keep,]
+
+# Number excluded genes
+sum(!to.keep)
+dim(sce)
+
+```
+
+```{r normalize, include=FALSE}
+
+# library size normaliztion
+clusters <- scran::quickCluster(sce, method = "igraph", 
+                                min.mean = 0.1, BPPARAM = bp)
+sce <- scran::computeSumFactors(sce, min.mean = 0.1,
+                                cluster = clusters, BPPARAM = bp)
+plot(scater::librarySizeFactors(sce), sizeFactors(sce), pch = 16,
+    xlab = "Library size factors", ylab = "Deconvolution factors", log = "xy")
+sce <- scater::logNormCounts(sce)
+sce
+
+```
+
+```{r mv_trend, include=FALSE}
+
+
+# get mean variance trend
+dec.pbmc <- scran::modelGeneVarByPoisson(sce, BPPARAM = bp)
+top.pbmc <- scran::getTopHVGs(dec.pbmc, prop = 0.1)
+plot(dec.pbmc$mean, dec.pbmc$total, pch=16, cex=0.5,
+    xlab="Mean of log-expression", ylab="Variance of log-expression")
+curfit <- metadata(dec.pbmc)
+curve(curfit$trend(x), col = 'dodgerblue', add = TRUE, lwd = 2)
+
+```
+
+```{r denoise, include=FALSE}
+
+# denoise
+sce <- scran::denoisePCA(sce, subset.row = top.pbmc,
+                         technical = dec.pbmc, BPPARAM = bp,
+                         min.rank=5, max.rank=20)
+ncol(reducedDim(sce, "PCA"))
+
+plot(attr(reducedDim(sce), "percentVar"), xlab = "PC",
+     ylab = "Proportion of variance explained")
+abline(v = ncol(reducedDim(sce, "PCA")), lty = 2, col = "red")
+
+
+```
+
+```{r tsne, include=FALSE}
+
+#tsne
+sce <- scater::runTSNE(sce, dimred = "PCA", perplexity = 30, BPPARAM = bp)
+sce$sizeFactor <- sizeFactors(sce)
+scater::plotTSNE(sce, colour_by = "sizeFactor")
+
+
+```
+
+```{r cluster, include=FALSE}
+
+#cluster
+snn.gr <- scran::buildSNNGraph(sce, use.dimred = "PCA", BPPARAM = bp, k = 25)
+clusters <- igraph::cluster_walktrap(snn.gr)
+sce$Cluster <- factor(clusters$membership)
+table(sce$Cluster)
+
+cluster.mod <- bluster::pairwiseModularity(snn.gr, sce$Cluster,
+                                        get.weights = TRUE)
+log.ratio <- log2(cluster.mod$observed / cluster.mod$expected + 1)
+
+scater::plotTSNE(sce, colour_by = "Cluster")
+
+```
+## consensusOV subtype annotation
+
+```{r consensusOV, include=FALSE}
+
+sce.entrez <- EnrichmentBrowser::idMap(sce, org = "hsa", 
+                                       from = "SYMBOL", to = "ENTREZID")
+am <- as.matrix(assay(sce.entrez, "logcounts"))
+cst <- consensusOV::get.consensus.subtypes(am, names(sce.entrez))
+
+sts <- sub("_consensus$", "", as.vector(cst$consensusOV.subtypes))
+sce$subtype <- sts
+sce$margin <- consensusOV::margin(cst$rf.probs)
+
+summary(sce$margin)
+scater::plotTSNE(sce, colour_by = "subtype")
+scater::plotTSNE(sce, colour_by = "margin")
+
+#write it out
+outdf = data.frame(cst$rf.probs)
+outdf$barcode = sce$Barcode
+outdf$gse_id = sce$Sample
+outdf$subtype = sce$subtype
+
+outfile = paste0(data_dir, "/../GSE217517_metadata/", sample_ids[curr_idx], "_subtypes.tsv")
+write.table(outdf, outfile, sep="\t", quote=F, row.names=F)
+
+```
+
+
