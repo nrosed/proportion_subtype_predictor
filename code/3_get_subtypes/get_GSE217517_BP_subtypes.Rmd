@@ -1,0 +1,69 @@
+---
+title: "get_samp_subtypes"
+author: "Natalie Davidson"
+output: github_document
+date: '2024-12-17'
+---
+
+```{r setup12, include=FALSE}
+
+#knitr::opts_chunk$set(echo = TRUE)
+
+renv::load()
+
+require(here)
+
+# OVC
+
+library(consensusOV)
+library(SingleCellExperiment)
+
+
+
+proj_dir = "/Users/davidnat/Documents/projects/davidsonlab/projects/proportion_subtype_predictor/"
+
+data_dir = paste0(proj_dir, "/data/single_cell/augmented/")
+sample_ids = c("all-cellType", "all-subtype", "all-granular")
+
+curr_idx = 3
+
+
+```
+
+```{r consensusOV, include=FALSE}
+
+in_ad = paste0(data_dir, sample_ids[curr_idx], ".tsv")
+in_df = data.frame(fread(in_ad))
+
+```
+
+
+## consensusOV subtype annotation
+
+```{r consensusOV, include=FALSE}
+
+sce.entrez <- EnrichmentBrowser::idMap(in_sce, org = "hsa", 
+                                       from = "SYMBOL", to = "ENTREZID")
+am <- as.matrix(assay(sce.entrez, "logcounts"))
+cst <- consensusOV::get.consensus.subtypes(am, names(sce.entrez))
+
+sts <- sub("_consensus$", "", as.vector(cst$consensusOV.subtypes))
+in_sce$subtype <- sts
+in_sce$margin <- consensusOV::margin(cst$rf.probs)
+
+summary(in_sce$margin)
+scater::plotTSNE(in_sce, colour_by = "subtype")
+scater::plotTSNE(in_sce, colour_by = "margin")
+
+#write it out
+outdf = data.frame(cst$rf.probs)
+outdf$barcode = in_sce$Barcode
+outdf$gse_id = in_sce$Sample
+outdf$subtype = in_sce$subtype
+
+in_ad = paste0(data_dir, sample_ids[curr_idx], "_subtypes.h5ad")
+write.table(outdf, outfile, sep="\t", quote=F, row.names=F)
+
+```
+
+
